@@ -102,6 +102,10 @@ $(() => {
         const handleDisplayModal = async (toolIdx) => {
             self.templateData.toolIdx(toolIdx);
 
+            // Reset the search so a leftover term (e.g. a scanned spool URL
+            // from the last selection) can't trigger an unintended auto-select
+            self.templateData.searchFilter("");
+
             await refreshView();
         };
 
@@ -248,6 +252,20 @@ $(() => {
         };
 
         /**
+         * Extract a spool ID from a Spoolman spool URL, e.g.
+         * "https://spoolman.example.com/api/v1/spool/123" or
+         * "https://spoolman.example.com/spools/123" -> "123".
+         * Allows searching by scanning a QR code containing the spool URL.
+         *
+         * @param {string} term
+         * @returns {string | undefined} The extracted spool ID, or undefined if the term is not a spool URL
+         */
+        const getSpoolIdFromUrl = (term) => {
+            const match = term.match(/spools?\/(\d+)/i);
+            return match ? match[1] : undefined;
+        };
+
+        /**
          * Filter & sort table items before displaying
          */
         self.templateData.computedTableItemsOnCurrentPage = ko.computed(function () {
@@ -258,16 +276,26 @@ $(() => {
             const filterTerm = self.templateData.searchFilter().toLowerCase();
             const items = self.templateData.tableItemsOnCurrentPage();
 
-            const filterTermParts = filterTerm
-                .split(" ")
-                .map((subTerm) => {
-                    return subTerm.trim();
-                })
-                .filter((subTerm) => {
-                    return subTerm.length > 0;
-                });
+            // If the search term is a Spoolman spool URL (e.g. scanned from a QR
+            // code), select exactly the spool it references
+            const urlSpoolId = getSpoolIdFromUrl(filterTerm.trim());
 
             const filteredItems = (() => {
+                if (urlSpoolId !== undefined) {
+                    return items.filter((item) => {
+                        return String(item.spoolData.id) === urlSpoolId;
+                    });
+                }
+
+                const filterTermParts = filterTerm
+                    .split(" ")
+                    .map((subTerm) => {
+                        return subTerm.trim();
+                    })
+                    .filter((subTerm) => {
+                        return subTerm.length > 0;
+                    });
+
                 if (!filterTermParts.length) {
                     return items;
                 }
@@ -318,6 +346,57 @@ $(() => {
             setTimeout(() => {
                 refreshModalLayout();
             }, 100);
+        });
+
+        /**
+         * Auto-select a spool when the search term is a Spoolman spool URL
+         * (e.g. scanned from a QR code) that resolves to exactly one valid
+         * spool. Debounced, since scanners send the URL character by
+         * character - a partial ID like "4" could otherwise select the wrong
+         * spool before "42" is fully scanned.
+         */
+        const autoSelectCandidateFromUrl = ko.computed(() => {
+            const urlSpoolId = getSpoolIdFromUrl(self.templateData.searchFilter().trim());
+            if (urlSpoolId === undefined) {
+                return undefined;
+            }
+
+            const matchingItems = self.templateData.tableItemsOnCurrentPage().filter((item) => {
+                return String(item.spoolData.id) === urlSpoolId;
+            });
+
+            if (matchingItems.length !== 1 || !matchingItems[0].isSpoolValid) {
+                return undefined;
+            }
+
+            return {
+                toolIdx: self.templateData.toolIdx(),
+                spoolId: matchingItems[0].spoolId,
+            };
+        }, self.templateData);
+
+        let autoSelectTimeout = undefined;
+        let autoSelectLastKey = undefined;
+        autoSelectCandidateFromUrl.subscribe((candidate) => {
+            const candidateKey = candidate ? `${candidate.toolIdx}:${candidate.spoolId}` : undefined;
+            if (candidateKey === autoSelectLastKey) {
+                return;
+            }
+            autoSelectLastKey = candidateKey;
+
+            if (autoSelectTimeout !== undefined) {
+                clearTimeout(autoSelectTimeout);
+                autoSelectTimeout = undefined;
+            }
+
+            if (candidate === undefined) {
+                return;
+            }
+
+            autoSelectTimeout = setTimeout(() => {
+                autoSelectTimeout = undefined;
+                void handleSelectSpoolForTool(candidate.toolIdx, candidate.spoolId);
+            }, 250);
         });
 
         $(document).on("shown", SpoolmanModalSelectSpoolComponent.modalSelector, async () => {
